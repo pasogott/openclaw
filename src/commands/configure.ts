@@ -67,13 +67,16 @@ import {
   GOOGLE_GEMINI_DEFAULT_MODEL,
 } from "./google-gemini-model-default.js";
 import { healthCommand } from "./health.js";
+import { formatHealthCheckFailure } from "./health-format.js";
 import {
   applyAuthProfileConfig,
   applyMinimaxConfig,
   applyMinimaxHostedConfig,
+  applyOpencodeZenConfig,
   setAnthropicApiKey,
   setGeminiApiKey,
   setMinimaxApiKey,
+  setOpencodeZenApiKey,
   writeOAuthCredentials,
 } from "./onboard-auth.js";
 import {
@@ -95,6 +98,7 @@ import {
   applyOpenAICodexModelDefault,
   OPENAI_CODEX_DEFAULT_MODEL,
 } from "./openai-codex-model-default.js";
+import { OPENCODE_ZEN_DEFAULT_MODEL } from "./opencode-zen-model-default.js";
 import { ensureSystemdUserLingerInteractive } from "./systemd-linger.js";
 
 export const CONFIGURE_WIZARD_SECTIONS = [
@@ -366,6 +370,7 @@ async function promptAuthConfig(
     | "apiKey"
     | "minimax-cloud"
     | "minimax"
+    | "opencode-zen"
     | "skip";
 
   let next = cfg;
@@ -783,6 +788,32 @@ async function promptAuthConfig(
     next = applyMinimaxHostedConfig(next);
   } else if (authChoice === "minimax") {
     next = applyMinimaxConfig(next);
+  } else if (authChoice === "opencode-zen") {
+    note(
+      [
+        "OpenCode Zen provides access to Claude, GPT, Gemini, and more models.",
+        "Get your API key at: https://opencode.ai/auth",
+      ].join("\n"),
+      "OpenCode Zen",
+    );
+    const key = guardCancel(
+      await text({
+        message: "Enter OpenCode Zen API key",
+        validate: (value) => (value?.trim() ? undefined : "Required"),
+      }),
+      runtime,
+    );
+    await setOpencodeZenApiKey(String(key).trim());
+    next = applyAuthProfileConfig(next, {
+      profileId: "opencode-zen:default",
+      provider: "opencode-zen",
+      mode: "api_key",
+    });
+    next = applyOpencodeZenConfig(next);
+    note(
+      `Default model set to ${OPENCODE_ZEN_DEFAULT_MODEL}`,
+      "Model configured",
+    );
   }
 
   const currentModel =
@@ -1256,7 +1287,7 @@ export async function runConfigureWizard(
     try {
       await healthCommand({ json: false, timeoutMs: 10_000 }, runtime);
     } catch (err) {
-      runtime.error(`Health check failed: ${String(err)}`);
+      runtime.error(formatHealthCheckFailure(err));
       note(
         [
           "Docs:",

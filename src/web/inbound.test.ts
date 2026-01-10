@@ -75,6 +75,23 @@ describe("web inbound helpers", () => {
     expect(body).toBe("<contact: Ada Lovelace, +15555550123>");
   });
 
+  it("trims and skips empty WhatsApp vcard phones", () => {
+    const body = extractText({
+      contactMessage: {
+        vcard: [
+          "BEGIN:VCARD",
+          "VERSION:3.0",
+          "FN:Ada Lovelace",
+          "TEL;TYPE=CELL:  +15555550123  ",
+          "TEL;TYPE=HOME:   ",
+          "TEL;TYPE=WORK:+15555550124",
+          "END:VCARD",
+        ].join("\n"),
+      },
+    } as unknown as import("@whiskeysockets/baileys").proto.IMessage);
+    expect(body).toBe("<contact: Ada Lovelace, +15555550123 (+1 more)>");
+  });
+
   it("extracts multiple WhatsApp contact cards", () => {
     const body = extractText({
       contactsArrayMessage: {
@@ -124,7 +141,7 @@ describe("web inbound helpers", () => {
       },
     } as unknown as import("@whiskeysockets/baileys").proto.IMessage);
     expect(body).toBe(
-      "<contacts: Alice, +15555550101, Bob, +15555550102, Charlie, +15555550103 (+1 more) +1 more>",
+      "<contacts: Alice, +15555550101, Bob, +15555550102, Charlie, +15555550103 (+1 more), Dana, +15555550105>",
     );
   });
 

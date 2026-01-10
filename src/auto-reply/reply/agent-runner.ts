@@ -22,6 +22,7 @@ import {
   emitAgentEvent,
   registerAgentRunContext,
 } from "../../infra/agent-events.js";
+import { isAudioFileName } from "../../media/mime.js";
 import { defaultRuntime } from "../../runtime.js";
 import {
   estimateUsageCost,
@@ -32,10 +33,12 @@ import {
 import { stripHeartbeatToken } from "../heartbeat.js";
 import type { OriginatingChannelType, TemplateContext } from "../templating.js";
 import { normalizeVerboseLevel, type VerboseLevel } from "../thinking.js";
-import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
+import { SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
-import { extractAudioTag } from "./audio-tags.js";
-import { createBlockReplyPipeline } from "./block-reply-pipeline.js";
+import {
+  createAudioAsVoiceBuffer,
+  createBlockReplyPipeline,
+} from "./block-reply-pipeline.js";
 import { resolveBlockStreamingCoalescing } from "./block-streaming.js";
 import { createFollowupRunner } from "./followup-runner.js";
 import {
@@ -44,6 +47,7 @@ import {
   type QueueSettings,
   scheduleFollowupDrain,
 } from "./queue.js";
+import { parseReplyDirectives } from "./reply-directives.js";
 import {
   applyReplyTagsToPayload,
   applyReplyThreading,
@@ -260,6 +264,13 @@ export async function runReplyAgent(params: {
   const pendingToolTasks = new Set<Promise<void>>();
   const blockReplyTimeoutMs =
     opts?.blockReplyTimeoutMs ?? BLOCK_REPLY_SEND_TIMEOUT_MS;
+
+  const hasAudioMedia = (urls?: string[]): boolean =>
+    Boolean(urls?.some((u) => isAudioFileName(u)));
+  const isAudioPayload = (payload: ReplyPayload) =>
+    hasAudioMedia(
+      payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : undefined),
+    );
   const replyToChannel =
     sessionCtx.OriginatingChannel ??
     ((sessionCtx.Surface ?? sessionCtx.Provider)?.toLowerCase() as
@@ -289,6 +300,7 @@ export async function runReplyAgent(params: {
           onBlockReply: opts.onBlockReply,
           timeoutMs: blockReplyTimeoutMs,
           coalescing: blockReplyCoalescing,
+          buffer: createAudioAsVoiceBuffer({ isAudioPayload }),
         })
       : null;
 
@@ -532,30 +544,53 @@ export async function runReplyAgent(params: {
                       },
                       sessionCtx.MessageSid,
                     );
-                    if (!isRenderablePayload(taggedPayload)) return;
-                    const audioTagResult = extractAudioTag(taggedPayload.text);
-                    const cleaned = audioTagResult.cleaned || undefined;
+                    // Let through payloads with audioAsVoice flag even if empty (need to track it)
+                    if (
+                      !isRenderablePayload(taggedPayload) &&
+                      !payload.audioAsVoice
+                    )
+                      return;
+                    const parsed = parseReplyDirectives(
+                      taggedPayload.text ?? "",
+                      {
+                        currentMessageId: sessionCtx.MessageSid,
+                        silentToken: SILENT_REPLY_TOKEN,
+                      },
+                    );
+                    const cleaned = parsed.text || undefined;
                     const hasMedia =
                       Boolean(taggedPayload.mediaUrl) ||
                       (taggedPayload.mediaUrls?.length ?? 0) > 0;
-                    if (!cleaned && !hasMedia) return;
+                    // Skip empty payloads unless they have audioAsVoice flag (need to track it)
                     if (
-                      isSilentReplyText(cleaned, SILENT_REPLY_TOKEN) &&
-                      !hasMedia
+                      !cleaned &&
+                      !hasMedia &&
+                      !payload.audioAsVoice &&
+                      !parsed.audioAsVoice
                     )
                       return;
+                    if (parsed.isSilent && !hasMedia) return;
+
                     const blockPayload: ReplyPayload = applyReplyToMode({
                       ...taggedPayload,
                       text: cleaned,
-                      audioAsVoice: audioTagResult.audioAsVoice,
+                      audioAsVoice: Boolean(
+                        parsed.audioAsVoice || payload.audioAsVoice,
+                      ),
+                      replyToId: taggedPayload.replyToId ?? parsed.replyToId,
+                      replyToTag: taggedPayload.replyToTag || parsed.replyToTag,
+                      replyToCurrent:
+                        taggedPayload.replyToCurrent || parsed.replyToCurrent,
                     });
+
                     void typingSignals
-                      .signalTextDelta(taggedPayload.text)
+                      .signalTextDelta(cleaned ?? taggedPayload.text)
                       .catch((err) => {
                         logVerbose(
                           `block reply typing signal failed: ${String(err)}`,
                         );
                       });
+
                     blockReplyPipeline?.enqueue(blockPayload);
                   }
                 : undefined,
@@ -670,6 +705,7 @@ export async function runReplyAgent(params: {
     }
 
     const payloadArray = runResult.payloads ?? [];
+
     if (blockReplyPipeline) {
       await blockReplyPipeline.flush({ force: true });
       blockReplyPipeline.stop();
@@ -677,6 +713,7 @@ export async function runReplyAgent(params: {
     if (pendingToolTasks.size > 0) {
       await Promise.allSettled(pendingToolTasks);
     }
+
     // Drain any late tool/block deliveries before deciding there's "nothing to send".
     // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
     // keep the typing indicator stuck.
@@ -711,11 +748,21 @@ export async function runReplyAgent(params: {
       currentMessageId: sessionCtx.MessageSid,
     })
       .map((payload) => {
-        const audioTagResult = extractAudioTag(payload.text);
+        const parsed = parseReplyDirectives(payload.text ?? "", {
+          currentMessageId: sessionCtx.MessageSid,
+          silentToken: SILENT_REPLY_TOKEN,
+        });
+        const mediaUrls = payload.mediaUrls ?? parsed.mediaUrls;
+        const mediaUrl = payload.mediaUrl ?? parsed.mediaUrl ?? mediaUrls?.[0];
         return {
           ...payload,
-          text: audioTagResult.cleaned ? audioTagResult.cleaned : undefined,
-          audioAsVoice: audioTagResult.audioAsVoice,
+          text: parsed.text ? parsed.text : undefined,
+          mediaUrls,
+          mediaUrl,
+          replyToId: payload.replyToId ?? parsed.replyToId,
+          replyToTag: payload.replyToTag || parsed.replyToTag,
+          replyToCurrent: payload.replyToCurrent || parsed.replyToCurrent,
+          audioAsVoice: Boolean(payload.audioAsVoice || parsed.audioAsVoice),
         };
       })
       .filter(isRenderablePayload);
@@ -751,8 +798,7 @@ export async function runReplyAgent(params: {
 
     const shouldSignalTyping = replyPayloads.some((payload) => {
       const trimmed = payload.text?.trim();
-      if (trimmed && !isSilentReplyText(trimmed, SILENT_REPLY_TOKEN))
-        return true;
+      if (trimmed) return true;
       if (payload.mediaUrl) return true;
       if (payload.mediaUrls && payload.mediaUrls.length > 0) return true;
       return false;

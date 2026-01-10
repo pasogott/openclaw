@@ -17,6 +17,7 @@ import {
   SettingsManager,
 } from "@mariozechner/pi-coding-agent";
 import { resolveHeartbeatPrompt } from "../auto-reply/heartbeat.js";
+import { parseReplyDirectives } from "../auto-reply/reply/reply-directives.js";
 import type {
   ReasoningLevel,
   ThinkLevel,
@@ -28,7 +29,6 @@ import type { ClawdbotConfig } from "../config/config.js";
 import { resolveProviderCapabilities } from "../config/provider-capabilities.js";
 import { getMachineDisplayName } from "../infra/machine-name.js";
 import { createSubsystemLogger } from "../logging.js";
-import { splitMediaFromOutput } from "../media/parse.js";
 import {
   type enqueueCommand,
   enqueueCommandInLane,
@@ -36,6 +36,7 @@ import {
 import { normalizeMessageProvider } from "../utils/message-provider.js";
 import { resolveUserPath } from "../utils.js";
 import { resolveClawdbotAgentDir } from "./agent-paths.js";
+import { resolveSessionAgentIds } from "./agent-scope.js";
 import {
   markAuthProfileFailure,
   markAuthProfileGood,
@@ -58,6 +59,7 @@ import {
   ensureAuthProfileStore,
   getApiKeyForModel,
   resolveAuthProfileOrder,
+  resolveModelAuthMode,
 } from "./model-auth.js";
 import { ensureClawdbotModelsJson } from "./models-config.js";
 import {
@@ -67,6 +69,7 @@ import {
   ensureSessionHeader,
   formatAssistantErrorText,
   isAuthAssistantError,
+  isCloudCodeAssistFormatError,
   isContextOverflowError,
   isFailoverAssistantError,
   isFailoverErrorMessage,
@@ -108,7 +111,6 @@ import {
 } from "./workspace.js";
 
 // Optional features can be implemented as Pi extensions that run in the same Node process.
-
 
 /**
  * Resolve provider-specific extraParams from model config.
@@ -604,10 +606,8 @@ export function createSystemPromptOverride(
   return () => trimmed;
 }
 
-// Tool names are now capitalized (Bash, Read, Write, Edit) to bypass Anthropic's
-// OAuth token blocking of lowercase names. However, pi-coding-agent's SDK has
-// hardcoded lowercase names in its built-in tool registry, so we must pass ALL
-// tools as customTools to bypass the SDK's filtering.
+// We always pass tools via `customTools` so our policy filtering, sandbox integration,
+// and extended toolset remain consistent across providers.
 
 type AnyAgentTool = AgentTool;
 
@@ -618,9 +618,8 @@ export function splitSdkTools(options: {
   builtInTools: AnyAgentTool[];
   customTools: ReturnType<typeof toToolDefinitions>;
 } {
-  // Always pass all tools as customTools to bypass pi-coding-agent's built-in
-  // tool filtering, which expects lowercase names (bash, read, write, edit).
-  // Our tools are now capitalized (Bash, Read, Write, Edit) for OAuth compatibility.
+  // Always pass all tools as customTools so the SDK doesn't "helpfully" swap in
+  // its own built-in implementations (we need our tool wrappers + policy).
   const { tools } = options;
   return {
     builtInTools: [],
@@ -842,6 +841,7 @@ export async function compactEmbeddedPiSession(params: {
           params.sessionKey ?? params.sessionId,
         );
         const contextFiles = buildBootstrapContextFiles(bootstrapFiles);
+        const runAbortController = new AbortController();
         const tools = createClawdbotCodingTools({
           bash: {
             ...params.config?.tools?.bash,
@@ -853,6 +853,9 @@ export async function compactEmbeddedPiSession(params: {
           sessionKey: params.sessionKey ?? params.sessionId,
           agentDir,
           config: params.config,
+          abortSignal: runAbortController.signal,
+          modelProvider: model.provider,
+          modelAuthMode: resolveModelAuthMode(model.provider, params.config),
           // No currentChannelId/currentThreadTs for compaction - not in message context
         });
         const machineName = await getMachineDisplayName();
@@ -881,15 +884,23 @@ export async function compactEmbeddedPiSession(params: {
           params.config?.agents?.defaults?.userTimezone,
         );
         const userTime = formatUserTime(new Date(), userTimezone);
+        // Only include heartbeat prompt for the default agent
+        const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
+          sessionKey: params.sessionKey,
+          config: params.config,
+        });
+        const isDefaultAgent = sessionAgentId === defaultAgentId;
         const appendPrompt = buildEmbeddedSystemPrompt({
           workspaceDir: effectiveWorkspace,
           defaultThinkLevel: params.thinkLevel,
           extraSystemPrompt: params.extraSystemPrompt,
           ownerNumbers: params.ownerNumbers,
           reasoningTagHint,
-          heartbeatPrompt: resolveHeartbeatPrompt(
-            params.config?.agents?.defaults?.heartbeat?.prompt,
-          ),
+          heartbeatPrompt: isDefaultAgent
+            ? resolveHeartbeatPrompt(
+                params.config?.agents?.defaults?.heartbeat?.prompt,
+              )
+            : undefined,
           skillsPrompt,
           runtimeInfo,
           sandboxInfo,
@@ -1017,6 +1028,7 @@ export async function runEmbeddedPiAgent(params: {
   onBlockReply?: (payload: {
     text?: string;
     mediaUrls?: string[];
+    audioAsVoice?: boolean;
   }) => void | Promise<void>;
   blockReplyBreak?: "text_end" | "message_end";
   blockReplyChunking?: BlockReplyChunking;
@@ -1045,6 +1057,7 @@ export async function runEmbeddedPiAgent(params: {
   const enqueueGlobal =
     params.enqueue ??
     ((task, opts) => enqueueCommandInLane(globalLane, task, opts));
+  const runAbortController = new AbortController();
   return enqueueCommandInLane(sessionLane, () =>
     enqueueGlobal(async () => {
       const started = Date.now();
@@ -1223,6 +1236,9 @@ export async function runEmbeddedPiAgent(params: {
             sessionKey: params.sessionKey ?? params.sessionId,
             agentDir,
             config: params.config,
+            abortSignal: runAbortController.signal,
+            modelProvider: model.provider,
+            modelAuthMode: resolveModelAuthMode(model.provider, params.config),
             currentChannelId: params.currentChannelId,
             currentThreadTs: params.currentThreadTs,
             replyToMode: params.replyToMode,
@@ -1242,15 +1258,23 @@ export async function runEmbeddedPiAgent(params: {
             params.config?.agents?.defaults?.userTimezone,
           );
           const userTime = formatUserTime(new Date(), userTimezone);
+          // Only include heartbeat prompt for the default agent
+          const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
+            sessionKey: params.sessionKey,
+            config: params.config,
+          });
+          const isDefaultAgent = sessionAgentId === defaultAgentId;
           const appendPrompt = buildEmbeddedSystemPrompt({
             workspaceDir: effectiveWorkspace,
             defaultThinkLevel: thinkLevel,
             extraSystemPrompt: params.extraSystemPrompt,
             ownerNumbers: params.ownerNumbers,
             reasoningTagHint,
-            heartbeatPrompt: resolveHeartbeatPrompt(
-              params.config?.agents?.defaults?.heartbeat?.prompt,
-            ),
+            heartbeatPrompt: isDefaultAgent
+              ? resolveHeartbeatPrompt(
+                  params.config?.agents?.defaults?.heartbeat?.prompt,
+                )
+              : undefined,
             skillsPrompt,
             runtimeInfo,
             sandboxInfo,
@@ -1326,6 +1350,7 @@ export async function runEmbeddedPiAgent(params: {
           const abortRun = (isTimeout = false) => {
             aborted = true;
             if (isTimeout) timedOut = true;
+            runAbortController.abort();
             void session.abort();
           };
           let subscription: ReturnType<typeof subscribeEmbeddedPiSession>;
@@ -1528,6 +1553,9 @@ export async function runEmbeddedPiAgent(params: {
           const assistantFailoverReason = classifyFailoverReason(
             lastAssistant?.errorMessage ?? "",
           );
+          const cloudCodeAssistFormatError = lastAssistant?.errorMessage
+            ? isCloudCodeAssistFormatError(lastAssistant.errorMessage)
+            : false;
 
           // Treat timeout as potential rate limit (Antigravity hangs on rate limit)
           const shouldRotate = (!aborted && failoverFailure) || timedOut;
@@ -1549,6 +1577,11 @@ export async function runEmbeddedPiAgent(params: {
               if (timedOut) {
                 log.warn(
                   `Profile ${lastProfileId} timed out (possible rate limit). Trying next account...`,
+                );
+              }
+              if (cloudCodeAssistFormatError) {
+                log.warn(
+                  `Profile ${lastProfileId} hit Cloud Code Assist format error. Tool calls will be sanitized on retry.`,
                 );
               }
             }
@@ -1594,6 +1627,10 @@ export async function runEmbeddedPiAgent(params: {
             text: string;
             media?: string[];
             isError?: boolean;
+            audioAsVoice?: boolean;
+            replyToId?: string;
+            replyToTag?: boolean;
+            replyToCurrent?: boolean;
           }> = [];
 
           const errorText = lastAssistant
@@ -1610,10 +1647,23 @@ export async function runEmbeddedPiAgent(params: {
           if (inlineToolResults) {
             for (const { toolName, meta } of toolMetas) {
               const agg = formatToolAggregate(toolName, meta ? [meta] : []);
-              const { text: cleanedText, mediaUrls } =
-                splitMediaFromOutput(agg);
+              const {
+                text: cleanedText,
+                mediaUrls,
+                audioAsVoice,
+                replyToId,
+                replyToTag,
+                replyToCurrent,
+              } = parseReplyDirectives(agg);
               if (cleanedText)
-                replyItems.push({ text: cleanedText, media: mediaUrls });
+                replyItems.push({
+                  text: cleanedText,
+                  media: mediaUrls,
+                  audioAsVoice,
+                  replyToId,
+                  replyToTag,
+                  replyToCurrent,
+                });
             }
           }
 
@@ -1632,18 +1682,46 @@ export async function runEmbeddedPiAgent(params: {
               ? [fallbackAnswerText]
               : [];
           for (const text of answerTexts) {
-            const { text: cleanedText, mediaUrls } = splitMediaFromOutput(text);
-            if (!cleanedText && (!mediaUrls || mediaUrls.length === 0))
+            const {
+              text: cleanedText,
+              mediaUrls,
+              audioAsVoice,
+              replyToId,
+              replyToTag,
+              replyToCurrent,
+            } = parseReplyDirectives(text);
+            if (
+              !cleanedText &&
+              (!mediaUrls || mediaUrls.length === 0) &&
+              !audioAsVoice
+            )
               continue;
-            replyItems.push({ text: cleanedText, media: mediaUrls });
+            replyItems.push({
+              text: cleanedText,
+              media: mediaUrls,
+              audioAsVoice,
+              replyToId,
+              replyToTag,
+              replyToCurrent,
+            });
           }
 
+          // Check if any replyItem has audioAsVoice tag - if so, apply to all media payloads
+          const hasAudioAsVoiceTag = replyItems.some(
+            (item) => item.audioAsVoice,
+          );
           const payloads = replyItems
             .map((item) => ({
               text: item.text?.trim() ? item.text.trim() : undefined,
               mediaUrls: item.media?.length ? item.media : undefined,
               mediaUrl: item.media?.[0],
               isError: item.isError,
+              replyToId: item.replyToId,
+              replyToTag: item.replyToTag,
+              replyToCurrent: item.replyToCurrent,
+              // Apply audioAsVoice to media payloads if tag was found anywhere in response
+              audioAsVoice:
+                item.audioAsVoice || (hasAudioAsVoiceTag && item.media?.length),
             }))
             .filter(
               (p) =>
